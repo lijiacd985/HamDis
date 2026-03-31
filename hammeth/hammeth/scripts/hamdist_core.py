@@ -160,23 +160,15 @@ def compress_bits_zero_one_nan_extended(matrix: np.ndarray):
     val_bits = np.zeros((num_rows, num_chunks), dtype=np.uint64)
     mask_bits = np.zeros((num_rows, num_chunks), dtype=np.uint64)
 
-    for i in range(num_rows):
-        row_data = matrix[i]
-        for chunk_idx in range(num_chunks):
-            start_col = chunk_idx * 64
-            end_col = min((chunk_idx + 1) * 64, num_cols)
-            vb = np.uint64(0)
-            mb = np.uint64(0)
-            for col in range(start_col, end_col):
-                val = row_data[col]
-                if not math.isnan(val):
-                    shift_amount = col - start_col
-                    shifted_val = 1 << shift_amount
-                    mb |= np.uint64(shifted_val)
-                    if val == 1:
-                        vb |= np.uint64(shifted_val)
-            val_bits[i, chunk_idx] = vb
-            mask_bits[i, chunk_idx] = mb
+    for chunk_idx in range(num_chunks):
+        start_col = chunk_idx * 64
+        end_col = min((chunk_idx + 1) * 64, num_cols)
+        chunk = matrix[:, start_col:end_col]
+        valid_mask = ~np.isnan(chunk)
+        one_mask = (chunk == 1) & valid_mask
+        bit_weights = (1 << np.arange(end_col - start_col, dtype=np.uint64))
+        mask_bits[:, chunk_idx] = (valid_mask.astype(np.uint64) * bit_weights).sum(axis=1, dtype=np.uint64)
+        val_bits[:, chunk_idx] = (one_mask.astype(np.uint64) * bit_weights).sum(axis=1, dtype=np.uint64)
     return val_bits, mask_bits
 
 
@@ -196,18 +188,24 @@ def pairwise_hamming_ignore_nan_extended(val_bits: np.ndarray, mask_bits: np.nda
     distance_matrix = np.zeros((n, n), dtype=float)
     hamming_counts = 0
     reads_bin_idx = []
+    byte_popcount_lut = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
+
+    def _popcount_sum_uint64(arr: np.ndarray) -> int:
+        if arr.size == 0:
+            return 0
+        # 使用查表法统计每个 byte 的 bit 数，避免在双层循环中反复 unpackbits
+        return int(byte_popcount_lut[arr.view(np.uint8)].sum())
 
     for i_ in range(n):
         for j_ in range(i_ + 1, n):
-            total_diff = 0
-            total_common = 0
-            for chunk_idx in range(num_chunks):
-                common_mask = mask_bits[i_, chunk_idx] & mask_bits[j_, chunk_idx]
-                if common_mask != 0:
-                    diff_bits = (val_bits[i_, chunk_idx] ^ val_bits[j_, chunk_idx]) & common_mask
-                    popc = popcount_u64(diff_bits)
-                    total_diff += popc
-                    total_common += popcount_u64(common_mask)
+            common_mask = mask_bits[i_] & mask_bits[j_]
+            if np.any(common_mask):
+                diff_bits = (val_bits[i_] ^ val_bits[j_]) & common_mask
+                total_diff = _popcount_sum_uint64(diff_bits)
+                total_common = _popcount_sum_uint64(common_mask)
+            else:
+                total_diff = 0
+                total_common = 0
 
             if total_common == 0:
                 dist = np.nan
@@ -242,58 +240,40 @@ def merge_reads(result_1, cell_ids):
             continue
 
         cell_reads = result_1[indices, :]
-        n_reads = cell_reads.shape[0]
-        processed = [False] * n_reads
+        n_reads, n_sites = cell_reads.shape
+        valid_mask = ~np.isnan(cell_reads)
+        # 使用 int32 防止 CpG 位点较多时矩阵乘法计数溢出
+        valid_i32 = valid_mask.astype(np.int32)
+        overlap_graph = (valid_i32 @ valid_i32.T) > 0
 
+        visited = np.zeros(n_reads, dtype=bool)
         for i in range(n_reads):
-            if processed[i]:
+            if visited[i]:
                 continue
-            current_group = [i]
-            processed[i] = True
+            stack = [i]
+            visited[i] = True
+            component = []
+            while stack:
+                node = stack.pop()
+                component.append(node)
+                neigh = np.flatnonzero(overlap_graph[node] & (~visited))
+                if neigh.size > 0:
+                    visited[neigh] = True
+                    stack.extend(neigh.tolist())
 
-            while True:
-                added_new = False
-                for j in range(n_reads):
-                    if processed[j]:
-                        continue
-                    has_overlap = False
-                    for idx in current_group:
-                        read_i = cell_reads[idx]
-                        read_j = cell_reads[j]
-                        valid_i = ~np.isnan(read_i)
-                        valid_j = ~np.isnan(read_j)
-                        overlap = np.logical_and(valid_i, valid_j)
-                        if np.any(overlap):
-                            has_overlap = True
-                            break
-                    if has_overlap:
-                        current_group.append(j)
-                        processed[j] = True
-                        added_new = True
-                if not added_new:
-                    break
+            if len(component) == 1:
+                merged_reads_list.append(cell_reads[component[0]])
+                merged_cell_ids.append(cell)
+                continue
 
-            if len(current_group) > 1:
-                group_reads = cell_reads[current_group]
-                n_sites = cell_reads.shape[1]
-                consensus = np.full(n_sites, np.nan)
-                for j in range(n_sites):
-                    site_vals = group_reads[:, j]
-                    valid_vals = site_vals[~np.isnan(site_vals)]
-                    if valid_vals.size > 0:
-                        count_0 = np.sum(valid_vals == 0)
-                        count_1 = np.sum(valid_vals == 1)
-                        if count_0 > count_1:
-                            consensus[j] = 0
-                        elif count_1 > count_0:
-                            consensus[j] = 1
-                        else:
-                            consensus[j] = np.nan
-                merged_reads_list.append(consensus)
-                merged_cell_ids.append(cell)
-            else:
-                merged_reads_list.append(cell_reads[current_group[0]])
-                merged_cell_ids.append(cell)
+            group_reads = cell_reads[component]
+            count_0 = np.nansum(group_reads == 0, axis=0)
+            count_1 = np.nansum(group_reads == 1, axis=0)
+            consensus = np.full(n_sites, np.nan)
+            consensus[count_0 > count_1] = 0
+            consensus[count_1 > count_0] = 1
+            merged_reads_list.append(consensus)
+            merged_cell_ids.append(cell)
 
     merged_array = np.array(merged_reads_list)
     return merged_array, merged_cell_ids
