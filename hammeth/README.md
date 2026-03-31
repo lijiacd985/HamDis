@@ -19,3 +19,9 @@ positional arguments:
 
 optional arguments:
   -h, --help            show this help message and exit
+
+## GPU acceleration
+
+`hamdist` now supports an optional `--use_gpu` flag to accelerate pairwise
+Hamming distance calculation with CUDA (via CuPy). If GPU/CuPy is unavailable
+or GPU runtime fails, the pipeline automatically falls back to CPU.
