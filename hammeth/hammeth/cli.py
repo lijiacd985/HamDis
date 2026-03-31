@@ -46,6 +46,7 @@ def main():
     parser_hamdist.add_argument("--max_dis", type=int, default=2000, help="read 回溯距离")
     parser_hamdist.add_argument("--max_possible_read", type=int, default=200000, help="每个 bin 最大 read 数")
     parser_hamdist.add_argument("--basedon0", type=int, default=0, help="是否转为 0-based")
+    parser_hamdist.add_argument("--use_gpu", action="store_true", help="启用 GPU 加速（需安装 CuPy）")
     parser_hamdist.set_defaults(func=run_hamdist)
 
     # =========================

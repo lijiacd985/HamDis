@@ -20,4 +20,5 @@ def run_hamdist(args):
         max_dis=getattr(args, "max_dis", 2000),
         max_possible_read=getattr(args, "max_possible_read", 200000),
         basedon0=getattr(args, "basedon0", 0),
+        use_gpu=getattr(args, "use_gpu", False),
     )

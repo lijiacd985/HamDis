@@ -20,6 +20,13 @@ import pandas as pd
 
 warnings.filterwarnings("ignore")
 
+try:
+    import cupy as cp
+    _CUPY_AVAILABLE = True
+except Exception:
+    cp = None
+    _CUPY_AVAILABLE = False
+
 
 # =========================
 # 基础工具函数
@@ -191,11 +198,50 @@ def popcount_u64(x) -> int:
     return count
 
 
-def pairwise_hamming_ignore_nan_extended(val_bits: np.ndarray, mask_bits: np.ndarray):
+def _gpu_popcount_rows_u64(arr_u64):
+    """
+    对 uint64 数组按行统计 bit 数（GPU）。
+    输入 shape: (rows, chunks), 输出 shape: (rows,)
+    """
+    if arr_u64.ndim == 1:
+        arr_u64 = arr_u64.reshape(1, -1)
+    bits = cp.unpackbits(arr_u64.view(cp.uint8), axis=-1)
+    return bits.sum(axis=-1, dtype=cp.int32)
+
+
+def pairwise_hamming_ignore_nan_extended(val_bits: np.ndarray, mask_bits: np.ndarray, use_gpu=False):
     n, num_chunks = val_bits.shape
     distance_matrix = np.zeros((n, n), dtype=float)
     hamming_counts = 0
     reads_bin_idx = []
+
+    if use_gpu and _CUPY_AVAILABLE:
+        try:
+            _ = cp.cuda.runtime.getDeviceCount()
+            val_gpu = cp.asarray(val_bits, dtype=cp.uint64)
+            mask_gpu = cp.asarray(mask_bits, dtype=cp.uint64)
+            for i_ in range(n - 1):
+                common_mask = cp.bitwise_and(mask_gpu[i_], mask_gpu[i_ + 1:])
+                diff_bits = cp.bitwise_and(cp.bitwise_xor(val_gpu[i_], val_gpu[i_ + 1:]), common_mask)
+                total_common = _gpu_popcount_rows_u64(common_mask).astype(cp.float32)
+                total_diff = _gpu_popcount_rows_u64(diff_bits).astype(cp.float32)
+                dist = cp.where(
+                    total_common == 0,
+                    cp.nan,
+                    cp.where(total_diff == 0, 1e-10, total_diff / total_common),
+                )
+                dist_cpu = cp.asnumpy(dist)
+                distance_matrix[i_, i_ + 1:] = dist_cpu
+                distance_matrix[i_ + 1:, i_] = dist_cpu
+                valid = ~np.isnan(dist_cpu)
+                if np.any(valid):
+                    valid_j = np.where(valid)[0] + i_ + 1
+                    hamming_counts += int(valid_j.size)
+                    reads_bin_idx.extend([i_] * int(valid_j.size))
+                    reads_bin_idx.extend(valid_j.tolist())
+            return distance_matrix, hamming_counts, reads_bin_idx
+        except Exception as e:
+            print(f"[WARN] GPU 计算失败，自动回退 CPU: {e}")
 
     for i_ in range(n):
         for j_ in range(i_ + 1, n):
@@ -307,6 +353,7 @@ def get_unique_cells(cell_id):
 
 def pat_to_Hamming(merge_pat_file, cpg_file, region_file, out_file,
                    binsize=5000, basedon0=0, min_cpg=1, max_dis=2000,
+                   use_gpu=False,
                    max_possible_read=200000):
     """
     这里尽量按用户提供的原版脚本逻辑实现，使 _MeConcord.txt 的列意义与输出形式一致：
@@ -472,7 +519,11 @@ def pat_to_Hamming(merge_pat_file, cpg_file, region_file, out_file,
                 reads_bin_idx = []
 
                 val_bits, mask_bits = compress_bits_zero_one_nan_extended(result_1)
-                distance_matrix, hamming_counts, reads_bin_idx = pairwise_hamming_ignore_nan_extended(val_bits, mask_bits)
+                distance_matrix, hamming_counts, reads_bin_idx = pairwise_hamming_ignore_nan_extended(
+                    val_bits,
+                    mask_bits,
+                    use_gpu=use_gpu,
+                )
                 distance_sum = np.nansum(distance_matrix)
                 read_counts = len(set(reads_bin_idx))
                 cell_num = cellcount
@@ -522,6 +573,7 @@ def compute_metric(args):
         basedon0=hm_params['basedon0'],
         min_cpg=hm_params['min_cpg'],
         max_dis=hm_params['max_dis'],
+        use_gpu=hm_params['use_gpu'],
         max_possible_read=hm_params['max_possible_read'],
     )
 
@@ -822,6 +874,7 @@ def run_hamdist(
     max_dis=2000,
     max_possible_read=200000,
     basedon0=0,
+    use_gpu=False,
 ):
     pat_dir = os.path.abspath(pat_dir)
     output_root = infer_output_root(pat_dir, output_dir)
@@ -860,6 +913,7 @@ def run_hamdist(
         "basedon0": basedon0,
         "min_cpg": min_cpg,
         "max_dis": max_dis,
+        "use_gpu": use_gpu,
         "max_possible_read": max_possible_read,
     }
 
